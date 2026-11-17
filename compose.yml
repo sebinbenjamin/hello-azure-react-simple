@@ -1,0 +1,11 @@
+# Build the image from the Dockerfile in the current directory and start the app.
+services:
+  react-app-demo:
+    build:
+      context: .
+      dockerfile: dockerfile
+    # Forward host port 9000 to port 80 in the container.
+    ports:
+      - "8000:80"
+    # Use a fixed name for the running container.
+    container_name: my-react-demo-app

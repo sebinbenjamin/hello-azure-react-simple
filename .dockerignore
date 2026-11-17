@@ -1,0 +1,6 @@
+# Similar to your .gitignore
+
+node_modules
+.git
+.env
+dist
