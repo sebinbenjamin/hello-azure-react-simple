@@ -1,0 +1,207 @@
+# =============================================================================
+# CI/CD (full) — each stage of the pipeline is its own JOB
+# =============================================================================
+#
+# Words you'll see:
+#   workflow = this whole file. GitHub runs it when one of its triggers ("on:") happens.
+#   job      = a group of steps. Each job gets its OWN fresh virtual machine (a "runner"),
+#              so nothing is shared between jobs unless we pass it on (see "artifact").
+#   step     = a single command (run:) or a ready-made action (uses:).
+#   needs:   = "don't start this job until those jobs have succeeded".
+#
+# The flow of this pipeline:
+#
+#   lint ────────┐
+#   format ──────┤   these 4 run AT THE SAME TIME (in parallel)
+#   audit ───────┼──► build ──► deploy ──► smoke-test
+#   secret-scan ─┘   (saves dist/ as an artifact)
+#
+# If any box fails, everything to its right is skipped, so broken code never gets deployed.
+#
+# Compare with ci-cd-simple.yml, which does the same checks one after another in ONE job.
+# Splitting into jobs runs checks in parallel and shows exactly which stage failed,
+# at the cost of installing dependencies several times.
+#
+# OFF BY DEFAULT: it only runs when you start it by hand
+#   (GitHub → Actions tab → "CI/CD (full)" → Run workflow).
+# To switch it on for every push/PR, uncomment the push/pull_request triggers below
+# AND disable ci-cd-simple.yml, because both deploy to the same Azure Static Web App.
+# =============================================================================
+
+name: CI/CD (full)
+
+# ---- Triggers: WHEN does this workflow run? ----
+on:
+  workflow_dispatch: # Adds a "Run workflow" button in the Actions tab
+  # push: # Every push to main → check, then deploy to production
+  #   branches: [main]
+  # pull_request: # Every PR into main → check, then deploy a temporary preview site
+  #   types: [opened, synchronize, reopened, closed]
+  #   branches: [main]
+
+# ---- Permissions: what is the automatic GITHUB_TOKEN allowed to do? ----
+# Give it only what it needs (the "least privilege" principle). If this workflow
+# were ever tricked into running bad code, the damage it could do is limited.
+permissions:
+  contents: read # Read the code
+  pull-requests: write # Let Azure comment the preview URL on the PR
+
+# ---- Concurrency: what if you push twice quickly? ----
+# Runs in the same group cancel the older one, so you don't waste time
+# (and you never deploy an older commit on top of a newer one).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # STAGE 1: Quality gates. Fast checks that catch problems before we build.
+  # They don't depend on each other, so they run in parallel.
+  # The `if:` skips them when a PR is closed (then we only clean up, see the bottom).
+  # ===========================================================================
+
+  # Linting: ESLint looks for likely bugs and rule-breaking code (e.g. unused variables).
+  # Try it locally: npm run lint
+  lint:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest # A fresh Linux machine provided by GitHub
+    steps:
+      - uses: actions/checkout@v5 # Download the repo's code onto the runner
+      - uses: actions/setup-node@v5 # Install Node.js
+        with:
+          node-version: 24
+          cache: npm # Reuse downloaded packages between runs, so it's faster
+      # Dependency installation: `npm ci` (not `npm install`) installs EXACTLY the
+      # versions in package-lock.json, so CI uses the same packages as you do.
+      - run: npm ci
+      - run: npm run lint
+
+  # Formatting: Prettier checks that every file is formatted the same way.
+  # It only CHECKS here; it doesn't change files. If this fails, run `npm run format`
+  # on your machine and commit the result.
+  format:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+
+  # Security scanning: npm audit compares our dependencies against a database of
+  # known vulnerabilities. No `npm ci` needed: it only reads package-lock.json.
+  audit:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      # BLOCKING: fail only on high/critical issues in packages that ship to users.
+      # (--omit=dev ignores dev tools like ESLint and Vite, which never reach the browser.)
+      - run: npm audit --omit=dev --audit-level=high
+      # FOR INFORMATION: list everything, dev tools included. continue-on-error means
+      # this step can "fail" without failing the job. Read the log to see what's there.
+      - run: npm audit
+        continue-on-error: true
+
+  # Secret scanning: Gitleaks searches the code AND its whole git history for things
+  # that look like passwords, API keys or tokens committed by mistake.
+  # (GitHub's own secret scanning is a separate repo setting; this one runs in the pipeline.)
+  secret-scan:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Get ALL commits, not just the latest, so old leaks are found too
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Created by GitHub automatically for each run
+
+  # ===========================================================================
+  # STAGE 2: Build. Only starts if ALL four checks above passed.
+  # ===========================================================================
+  build:
+    needs: [lint, format, audit, secret-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Build: Vite bundles the React app into plain HTML/CSS/JS in the dist/ folder
+      - run: npm run build
+      # Artifact publishing: this runner is thrown away when the job ends, so we save
+      # dist/ to GitHub. The deploy job downloads it, and you can also download it
+      # from the run's summary page to look inside.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 7 # GitHub deletes it after a week
+
+  # ===========================================================================
+  # STAGE 3: Deploy the EXACT files we built and checked ("build once, deploy many").
+  # ===========================================================================
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # Outputs let a later job read a value from this one (here: the site's URL)
+    outputs:
+      url: ${{ steps.builddeploy.outputs.static_web_app_url }}
+    steps:
+      # No checkout or npm here: we only need the built files from the build job
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - name: Deploy to Azure Static Web Apps
+        id: builddeploy # An id lets us refer to this step's outputs (see "outputs:" above)
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          # Secrets are stored in GitHub (Settings → Secrets and variables → Actions),
+          # never in the code. GitHub hides them in the logs as ***.
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ZEALOUS_POND_06D195210 }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          skip_app_build: true # Don't let Azure build again; use our already-built dist/
+          app_location: "dist"
+          api_location: "" # No backend API in this app
+          output_location: ""
+
+  # ===========================================================================
+  # STAGE 4: Smoke test. "Did the deploy actually work?"
+  # A quick basic check of the live site, not a full test suite.
+  # ===========================================================================
+  smoke-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the deployed site responds and serves the app
+        # curl --fail     → fail if the server answers with an error (e.g. 404, 500)
+        # --retry ...     → a new deploy can take a few seconds to go live, so try again
+        # grep -q ...     → check the page really is our React app, not an error page
+        run: |
+          URL="${{ needs.deploy.outputs.url }}"
+          echo "Checking $URL"
+          curl --fail --silent --show-error --retry 5 --retry-delay 10 --retry-all-errors "$URL" | grep -q '<div id="root">'
+
+  # ===========================================================================
+  # Clean-up: when a PR is closed or merged, delete its temporary preview site.
+  # ===========================================================================
+  close_pull_request_job:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ZEALOUS_POND_06D195210 }}
+          action: "close"

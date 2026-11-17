@@ -1,0 +1,76 @@
+# SIMPLE pipeline: one job runs every check, then builds, deploys and smoke tests.
+# Steps run in order; if any step fails, the steps after it are skipped (no deploy).
+name: CI/CD (simple)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+jobs:
+  build_and_deploy_job:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    name: Build and Deploy Job
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      # Dependency installation: npm ci installs exactly what package-lock.json says
+      - name: Install dependencies
+        run: npm ci
+
+      # Linting: catches likely bugs and rule violations
+      - name: Lint
+        run: npm run lint
+
+      # Formatting: fails if any file isn't Prettier-formatted (fix locally with `npm run format`)
+      - name: Check formatting
+        run: npm run format:check
+
+      # Security scanning: fail on high/critical vulnerabilities in production dependencies
+      - name: Audit dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      # Build: compile and bundle into dist/
+      - name: Build
+        run: npm run build
+
+      # Deployment: upload the dist/ we just built and checked (skip Azure's own build)
+      - name: Deploy to Azure Static Web Apps
+        id: builddeploy
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ZEALOUS_POND_06D195210 }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }} # Used for GitHub integrations (i.e. PR comments)
+          action: "upload"
+          skip_app_build: true
+          app_location: "dist" # Already-built site
+          api_location: ""
+          output_location: ""
+
+      # Smoke testing: is the deployed site up and serving our app?
+      - name: Smoke test
+        run: |
+          URL="${{ steps.builddeploy.outputs.static_web_app_url }}"
+          echo "Checking $URL"
+          curl --fail --silent --show-error --retry 5 --retry-delay 10 --retry-all-errors "$URL" | grep -q '<div id="root">'
+
+  # Deletes the PR preview environment when a PR is closed
+  close_pull_request_job:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    name: Close Pull Request Job
+    steps:
+      - name: Close Pull Request
+        id: closepullrequest
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ZEALOUS_POND_06D195210 }}
+          action: "close"
