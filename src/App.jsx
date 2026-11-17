@@ -55,7 +55,7 @@ function App() {
             ? "Time's up! 🎉"
             : isRunning
               ? "Tick tock... ⏳"
-              : "Ready to start? 🚀"}
+              : "Ready to start nowwwww? 🚀"}
         </p>
       </div>
     </>
