@@ -1,75 +1,128 @@
-# SIMPLE pipeline: one job runs every check, then builds, deploys and smoke tests.
-# Steps run in order; if any step fails, the steps after it are skipped (no deploy).
+# =============================================================================
+# CI/CD (simple) — two jobs: CHECK the code, then DEPLOY it
+# =============================================================================
+#
+#   ci (one job, steps run in order)                       deploy
+#   install → lint → format → audit → build → save dist/ ──► get dist/ → deploy → smoke test
+#
+# Why two jobs and not one?
+#   - Steps inside a job run one after another. If one fails, the rest are skipped.
+#   - Jobs each get their own fresh machine. `needs: ci` makes deploy wait for ci to pass.
+#   - Only the deploy job uses the Azure secret. The checks never see it.
+#   - On a PR you see "CI" and "Deploy" as separate checks, so you can tell whether
+#     the CODE is broken or the DEPLOY is broken.
+#
+# Want each check as its own parallel job? See ci-cd-full.yml.
+# =============================================================================
+
 name: CI/CD (simple)
 
+# ---- Triggers: WHEN does this workflow run? ----
 on:
-  push:
+  push: # Every push to main → check, then deploy to production
     branches: [main]
-  pull_request:
+  pull_request: # Every PR into main → check, then deploy a temporary preview site
     types: [opened, synchronize, reopened, closed]
     branches: [main]
 
 jobs:
-  build_and_deploy_job:
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
-    runs-on: ubuntu-latest
-    name: Build and Deploy Job
+  # ===========================================================================
+  # JOB 1: Continuous Integration. Is the code good, and does it build?
+  # The `if:` skips it when a PR is closed (then we only clean up, see the bottom).
+  # ===========================================================================
+  ci:
+    name: CI
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest # A fresh Linux machine provided by GitHub
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # Download the repo's code onto the runner
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v5 # Install Node.js
         with:
           node-version: 24
-          cache: npm
+          cache: npm # Reuse downloaded packages between runs, so it's faster
 
-      # Dependency installation: npm ci installs exactly what package-lock.json says
+      # Dependency installation: `npm ci` (not `npm install`) installs EXACTLY the
+      # versions in package-lock.json, so CI uses the same packages as you do.
       - name: Install dependencies
         run: npm ci
 
-      # Linting: catches likely bugs and rule violations
+      # Linting: ESLint looks for likely bugs and rule-breaking code.
+      # Try it locally: npm run lint
       - name: Lint
         run: npm run lint
 
-      # Formatting: fails if any file isn't Prettier-formatted (fix locally with `npm run format`)
+      # Formatting: Prettier checks every file is formatted the same way.
+      # If this fails, run `npm run format` on your machine and commit the result.
       - name: Check formatting
         run: npm run format:check
 
-      # Security scanning: fail on high/critical vulnerabilities in production dependencies
+      # Security scanning: fail on high/critical known vulnerabilities in packages
+      # that ship to users (--omit=dev ignores dev tools like ESLint and Vite).
       - name: Audit dependencies
         run: npm audit --omit=dev --audit-level=high
 
-      # Build: compile and bundle into dist/
+      # Build: Vite bundles the React app into plain HTML/CSS/JS in dist/
       - name: Build
         run: npm run build
 
-      # Deployment: upload the dist/ we just built and checked (skip Azure's own build)
+      # Artifact publishing: this machine is thrown away when the job ends,
+      # so save dist/ to GitHub for the deploy job to download.
+      - name: Save build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+
+  # ===========================================================================
+  # JOB 2: Continuous Deployment. Ship the EXACT files the CI job built and checked.
+  # ===========================================================================
+  deploy:
+    name: Deploy
+    needs: ci # Only runs if the ci job passed
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout or npm here: we only need the built files from the ci job
+      - name: Get build output
+        uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+
       - name: Deploy to Azure Static Web Apps
-        id: builddeploy
+        id: builddeploy # An id lets later steps read this step's outputs (the site URL)
         uses: Azure/static-web-apps-deploy@v1
         with:
+          # Secrets live in GitHub (Settings → Secrets and variables → Actions),
+          # never in the code. GitHub hides them in the logs as ***.
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ZEALOUS_POND_06D195210 }}
-          repo_token: ${{ secrets.GITHUB_TOKEN }} # Used for GitHub integrations (i.e. PR comments)
+          repo_token: ${{ secrets.GITHUB_TOKEN }} # Lets Azure comment the preview URL on PRs
           action: "upload"
-          skip_app_build: true
-          app_location: "dist" # Already-built site
-          api_location: ""
+          skip_app_build: true # Don't let Azure build again; use our dist/
+          app_location: "dist"
+          api_location: "" # No backend API in this app
           output_location: ""
 
-      # Smoke testing: is the deployed site up and serving our app?
+      # Smoke testing: a quick "is the live site up and serving our app?" check.
+      #   curl --fail → fail on error responses (404, 500…)
+      #   --retry …   → a new deploy can take a few seconds to go live
+      #   grep -q …   → make sure it's really our React app, not an error page
       - name: Smoke test
         run: |
           URL="${{ steps.builddeploy.outputs.static_web_app_url }}"
           echo "Checking $URL"
           curl --fail --silent --show-error --retry 5 --retry-delay 10 --retry-all-errors "$URL" | grep -q '<div id="root">'
 
-  # Deletes the PR preview environment when a PR is closed
+  # ===========================================================================
+  # Clean-up: when a PR is closed or merged, delete its temporary preview site.
+  # ===========================================================================
   close_pull_request_job:
+    name: Close Pull Request Job
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
-    name: Close Pull Request Job
     steps:
       - name: Close Pull Request
-        id: closepullrequest
         uses: Azure/static-web-apps-deploy@v1
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ZEALOUS_POND_06D195210 }}
