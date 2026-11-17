@@ -1,6 +1,4 @@
 import { useState, useEffect } from "react";
-import reactLogo from "./assets/react.svg";
-import viteLogo from "/vite.svg";
 import "./App.css";
 
 function App() {
@@ -38,7 +36,7 @@ function App() {
 
   return (
     <>
-      <h1>Welcome to Sebin's countdown - v5</h1>
+      <h1>Welcome to Sebin&apos;s countdown - v5</h1>
       <div className="card">
         <h1 style={{ fontSize: "3rem" }}>{getEmoji()}</h1>
         <h2>5-Minute Countdown</h2>
@@ -56,8 +54,8 @@ function App() {
           {timeLeft === 0
             ? "Time's up! 🎉"
             : isRunning
-            ? "Tick tock... ⏳"
-            : "Ready to start? 🚀"}
+              ? "Tick tock... ⏳"
+              : "Ready to start? 🚀"}
         </p>
       </div>
     </>
